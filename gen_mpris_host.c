@@ -428,7 +428,7 @@ static DBusHandlerResult handle_root_get(DBusMessage *msg, DBusConnection *conn,
         dbus_message_iter_close_container(&args, &variant);
     } else if (strcmp(property, "DesktopEntry") == 0) {
         dbus_message_iter_open_container(&args, DBUS_TYPE_VARIANT, "s", &variant);
-        const char *val = "WACUP (32-bit)";
+        const char *val = "wacup";
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         dbus_message_iter_close_container(&args, &variant);
     } else if (strcmp(property, "SupportedUriSchemes") == 0 ||
@@ -481,7 +481,7 @@ static DBusHandlerResult handle_root_getall(DBusMessage *msg, DBusConnection *co
         const char *key = "DesktopEntry";
         dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
         dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
-        const char *val = "WACUP (32-bit)";
+        const char *val = "wacup";
         dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &val);
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
