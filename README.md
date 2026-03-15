@@ -1,13 +1,15 @@
-# gen_mpris — MPRIS2 Integration for WACUP (Wine)
+# MPRIS2 Integration for WACUP (Wine)
 
-Exposes [WACUP](https://getwacup.com/) running under Wine as a native MPRIS2 media player on Linux. Desktop media controls, taskbar widgets (KDE, GNOME), and tools like `playerctl` can see and control WACUP playback.
+Exposes [WACUP](https://getwacup.com/) running under Wine as a native MPRIS2 media player on Linux. Desktop media controls, taskbar widgets (KDE, GNOME), and tools like `playerctl` can see and control WACUP/WinAmp playback.
+
+Vibe-coded with Claude Code.
 
 ## How it works
 
 Two components communicate over TCP localhost:
 
-- **gen_mpris.dll** — A Winamp general-purpose plugin loaded by WACUP. Polls playback state via Winamp IPC and relays media commands.
-- **gen_mpris_host** — A native Linux process that registers on the D-Bus session bus as `org.mpris.MediaPlayer2.wacup` and bridges D-Bus method calls/signals to the DLL.
+- **gen_mpris.dll** - A Winamp general-purpose plugin loaded by WACUP. Polls playback state via Winamp IPC and relays media commands.
+- **gen_mpris_host** - A native Linux process that registers on the D-Bus session bus as `org.mpris.MediaPlayer2.wacup` and bridges D-Bus method calls/signals to the DLL.
 
 When WACUP loads the plugin, it automatically launches the host process. No manual setup is needed after installation.
 
@@ -35,7 +37,7 @@ sudo pacman -S gcc mingw-w64-gcc dbus pkg-config make
 
 ### Runtime dependencies
 
-- Wine (any version that runs WACUP — typically Wine 7.0+)
+- Wine (any version that runs WACUP - typically Wine 7.0+)
 - WACUP installed in a Wine prefix
 - D-Bus session bus (present on any modern desktop Linux)
 - `libdbus-1` (installed by default on most distros)
