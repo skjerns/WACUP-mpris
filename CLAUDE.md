@@ -1,142 +1,211 @@
 Your task is to create a plugin for WACUP (which is installed via wine-11.0 32bit on this system) that enables native MPRIS integration.
 
-The approach: a single `gen_mpris.dll` that runs inside WACUP and directly registers as an MPRIS2 player on the host's D-Bus session bus ? no external process.
-
-**The core problem:** The DLL is a Windows PE binary running in WINE. It cannot directly call `libdbus` (a Linux ELF shared library). There are several possible bridges:
-
-**Option A: WINE unixlib interface**
-- WINE 7.0+ has `__wine_unix_call` for PE ? Unix bridging
-- Requires building against WINE's internal headers and creating both a PE stub and a `.so` companion
-- Tightly coupled to WINE version, undocumented/unstable ABI
-- This is how `winepulse.drv` works internally
-
-**Realistic assessment:** Options A and C are the only truly "plugin-only" paths. Option A is the most maintainable. Option C is the most self-contained but amounts to reimplementing a D-Bus client from scratch over raw Unix sockets.
-
-Here's the plan for **Option A (WINE unixlib)**:
+**The core problem:** The DLL is a Windows PE binary running in Wine. It cannot directly call `libdbus` (a Linux ELF shared library). Three approaches were evaluated:
 
 ---
 
-## Plan: `gen_mpris` ? WINE unixlib plugin
+## Option A: Wine unixlib (`__wine_unix_call`)
 
-### Components
+**Status: Investigated — architecturally blocked for WACUP plugins.**
 
-```
-gen_mpris/
-??? gen_mpris.c          # PE-side: Winamp gen_ plugin, IPC with WACUP
-??? gen_mpris_unixlib.c  # Unix-side: D-Bus/MPRIS registration (linked against libdbus)
-??? unixlib.h            # Shared command/struct definitions between PE and Unix sides
-??? sdk/
-?   ??? gen.h            # Winamp SDK
-?   ??? wa_ipc.h         # Winamp IPC definitions
-??? Makefile             # Cross-compile PE + native .so
-??? README.md
-```
+Wine 7.0+ has `__wine_unix_call` for PE → Unix bridging. The PE DLL calls into a companion `.so` that can use native Linux libraries (libdbus, libX11, etc.). This is how `winepulse.drv`, `winewayland.drv` etc. work internally.
+
+### Requirements
+
+- Build with `winegcc` (not plain `i686-w64-mingw32-gcc`), using a `.spec` file and `winebuild --builtin`
+- PE DLL goes in `lib/wine/i386-windows/`, companion `.so` in `lib/wine/i386-unix/`
+- DLL must have the "Wine builtin DLL" signature — only then does Wine load the companion `.so` and register the unixlib function table
+- Need `libdbus-1-dev:i386` for the 32-bit `.so`
+- Must bundle `wine/unixlib.h` headers (ABI not stable across Wine versions)
+
+### Why it doesn't work for us
+
+WACUP loads plugins via `LoadLibrary("C:\...\Plugins\gen_mpris.dll")` with a full path. Wine treats files on the virtual C: drive as "native" Windows DLLs, **not builtins**. A native DLL never gets its companion `.so` loaded and `__wine_unix_call` will fail.
+
+Workarounds:
+- `WINEDLLOVERRIDES="gen_mpris=b"` to force builtin loading — fragile, requires user config
+- Stub DLL in Plugins/ that `LoadLibrary("gen_mpris")` by bare name — WACUP may not support this
+
+### Third-party example
+
+[wine-nvml](https://github.com/Saancreed/wine-nvml) — wraps NVIDIA's `libnvidia-ml.so` for Wine. Uses `winegcc`, `.spec` files, bundled Wine headers. Requires Wine >= 9.0.
+
+Wine 11.0 release notes mention installing `wine/unixlib.h` "as a first step towards supporting use of the Unixlib interface in third-party modules" — still a work in progress.
+
+### ABI stability
+
+The `__wine_unix_call` ABI changed between Wine 7/8/9. The `.so` must be compiled against the same Wine version's headers as the installed Wine. Not suitable for distributable plugins.
+
+---
+
+## Option B: External helper process over TCP (current implementation)
+
+**Status: Implemented and working.**
+
+A native Linux process (`gen_mpris_host`) handles D-Bus/MPRIS2 registration and X11 window tagging. The PE DLL communicates with it over TCP (localhost:39158).
+
+### Pros
+- Simple, reliable, works with any Wine version
+- DLL is a plain MinGW PE — no Wine internals dependency
+- Host can use any native Linux library (libdbus, libX11)
+- Clean separation of concerns
+
+### Cons
+- Extra process to manage (auto-launched by DLL, but can crash independently)
+- TCP overhead (negligible in practice — state updates are tiny)
+- Port collision risk (mitigated by using a fixed unusual port)
 
 ### Data flow
-
 ```
-KDE media key
-  ? D-Bus method call on org.mpris.MediaPlayer2.wacup
-  ? gen_mpris_unixlib.so (handles D-Bus, registered as MPRIS player)
-  ? __wine_unix_call dispatch
-  ? gen_mpris.dll (PE side, translates to SendMessage WM_WA_IPC)
-  ? WACUP responds
-
-WACUP state change (detected by PE-side polling timer)
-  ? gen_mpris.dll packages state into shared struct
-  ? __wine_unix_call to Unix side
-  ? gen_mpris_unixlib.so emits PropertiesChanged on D-Bus
-  ? KDE taskbar widget updates
+WACUP → gen_mpris.dll (PE, polls state via WM_WA_IPC)
+       → TCP localhost:39158
+       → gen_mpris_host (native ELF, D-Bus + X11)
+       → D-Bus session bus (MPRIS2)
+       → KDE/desktop media controls
 ```
 
-### Phase 1: Scaffolding & build system
+---
 
-1. Obtain Winamp SDK headers (`gen.h`, `wa_ipc.h`)
-2. Obtain WINE source headers for unixlib (`wine/unixlib.h`, `winternl.h`)
-3. Set up Makefile:
-   - PE side: `i686-w64-mingw32-gcc` ? `gen_mpris.dll`
-   - Unix side: native `gcc` ? `gen_mpris_unixlib.so`, linked with `-ldbus-1`
-   - Both produce outputs for the same WINE DLL pair
+## Option C: Raw D-Bus wire protocol over Unix sockets
 
-### Phase 2: Shared interface (`unixlib.h`)
+**Status: Not yet implemented. Most promising "single-binary" alternative.**
 
-Define the call table between PE ? Unix:
+Wine maps Unix domain sockets through its socket emulation, so the PE DLL can `connect()` to `$DBUS_SESSION_BUS_ADDRESS` directly and speak the D-Bus wire protocol. No libdbus needed — pure C socket code compiled with MinGW.
+
+### Existing D-Bus libraries evaluated
+
+- **udbus** (github.com/vincenthz/udbus) — ~900 lines C, implements wire protocol and auth, but client-only. Cannot register a bus name or act as a service. Would need significant extension.
+- **adbus** (github.com/jmckaskill/adbus) — complete C/C++ implementation, full service side, claims mingw compatibility, but partially C++ and archived since 2023.
+
+**Conclusion:** No ready-made solution exists. Option C requires implementing the D-Bus wire protocol from scratch, or heavily extending udbus.
+
+### What changes
+
+- `gen_mpris.c` gains a D-Bus implementation directly
+- `gen_mpris_host.c` and TCP IPC become obsolete
+- `ipc_protocol.h` becomes obsolete
+- X11 window tagging needs a separate solution (see Phase 5)
+
+### Pros
+- No external process
+- No Wine version coupling
+- Completely self-contained in `gen_mpris.dll`
+- Works with plain MinGW cross-compilation
+
+### Cons
+- Must reimplement D-Bus wire protocol (SASL auth, binary message marshaling, alignment, array/dict encoding)
+- Estimated ~1000-1500 lines of D-Bus protocol code
+- No fd passing support (not needed for MPRIS)
+- Must handle `$DBUS_SESSION_BUS_ADDRESS` parsing (Unix socket path extraction)
+
+### Phase 1 — Transport & Auth (~100 lines)
+
+Wine 3.18+ supports `AF_UNIX` in Winsock, so the DLL can connect directly to the D-Bus session socket.
 
 ```c
-enum mpris_unix_funcs {
-    unix_init,           // Initialize D-Bus connection, register MPRIS bus name
-    unix_shutdown,       // Release bus name, disconnect
-    unix_update_state,   // PE ? Unix: push new playback state + metadata
-    unix_poll_commands,  // PE ? Unix: check for pending MPRIS commands (play/pause/etc.)
-    unix_process_dbus,   // PE ? Unix: pump the D-Bus event loop
-};
-
-struct mpris_state {
-    int playback_status;   // 0=stopped, 1=playing, 3=paused
-    int position_ms;
-    int length_s;
-    int volume;            // 0-255
-    wchar_t title[512];
-    wchar_t artist[256];
-};
-
-struct mpris_command {
-    enum {
-        CMD_NONE, CMD_PLAY, CMD_PAUSE, CMD_PLAYPAUSE,
-        CMD_STOP, CMD_NEXT, CMD_PREV, CMD_SEEK, CMD_SETVOL,
-    } type;
-    int param;  // seek position or volume
-};
+// 1. GetEnvironmentVariableA("DBUS_SESSION_BUS_ADDRESS", ...)
+//    → parse "unix:path=/run/user/1000/bus"
+//      or   "unix:abstract=/tmp/dbus-XXXX"
+// 2. socket(AF_UNIX, SOCK_STREAM, 0) + connect()
+// 3. Auth handshake:
+//      send: \0AUTH EXTERNAL\r\n
+//      recv: OK <guid>\r\n
+//      send: BEGIN\r\n
 ```
 
-### Phase 3: PE side (`gen_mpris.c`)
+`AUTH EXTERNAL` without a UID argument relies on `SO_PEERCRED` — dbus-daemon checks credentials from the kernel, which works because wacup.exe is a real Linux process.
 
-- `init()`: call `__wine_unix_call(unix_init)` to set up D-Bus
-- Set a Windows timer (`SetTimer`) at ~250ms interval:
-  - Gather state via `SendMessage(hwndWA, WM_WA_IPC, ...)` ? status, position, length, title, volume
-  - Pack into `struct mpris_state`
-  - Call `__wine_unix_call(unix_update_state, &state)`
-  - Call `__wine_unix_call(unix_poll_commands, &cmd)`
-  - If command received, dispatch via `SendMessage(hwndWA, WM_COMMAND, ...)`
-  - Call `__wine_unix_call(unix_process_dbus)` to pump D-Bus
-- `quit()`: call `__wine_unix_call(unix_shutdown)`, kill timer
+### Phase 2 — Message serialization (~400 lines)
 
-### Phase 4: Unix side (`gen_mpris_unixlib.c`)
+D-Bus uses a binary wire format. Need a small builder:
 
-- `unix_init`: connect to session D-Bus, request name `org.mpris.MediaPlayer2.wacup`, register object `/org/mpris/MediaPlayer2`, set up vtables for both MPRIS interfaces
-- `unix_update_state`: compare with previous state, if changed emit `org.freedesktop.DBus.Properties.PropertiesChanged` signals with updated `PlaybackStatus`, `Metadata`, `Position`, `Volume`
-- `unix_poll_commands`: check if any D-Bus method calls arrived (Play, Pause, Next, etc.), return the next pending command
-- `unix_process_dbus`: call `dbus_connection_read_write_dispatch()` (non-blocking)
-- `unix_shutdown`: release bus name, close connection
+| Message                          | Direction | Complexity |
+|----------------------------------|-----------|------------|
+| `Hello` call                     | outbound  | simple     |
+| `RequestName(name, flags)` call  | outbound  | simple     |
+| Method return (empty body)       | outbound  | simple     |
+| `PropertiesChanged` signal       | outbound  | hard       |
+| `GetAll` reply (`a{sv}` body)    | outbound  | hard       |
 
-### Phase 5: MPRIS2 interface implementation (Unix side)
+The hard part is marshaling `a{sv}` (array of string→variant dict entries) with correct 8-byte alignment padding. This is essentially reimplementing libdbus's DBusMessageIter.
 
-Properties to expose:
+D-Bus header layout (16 bytes fixed):
 
-**`org.mpris.MediaPlayer2`**: Identity="WACUP", CanQuit=true, CanRaise=false
-
-**`org.mpris.MediaPlayer2.Player`**:
-- `PlaybackStatus` ? mapped from IPC_ISPLAYING
-- `Metadata` ? dict: `xesam:title`, `xesam:artist` (parsed from title string, Winamp uses "Artist - Title" format), `mpris:trackid`, `mpris:length`
-- `Position` ? microseconds (convert from ms)
-- `Volume` ? 0.0?1.0 (convert from 0?255)
-- `CanGoNext`, `CanGoPrevious`, `CanPlay`, `CanPause`, `CanSeek`, `CanControl` ? all true
-- `Rate` = 1.0, `MinimumRate` = 1.0, `MaximumRate` = 1.0
-
-Methods: `Play`, `Pause`, `PlayPause`, `Stop`, `Next`, `Previous`, `Seek`, `SetPosition` ? each queues a command for PE-side pickup.
-
-### Phase 6: Build & install
-
-```bash
-make                    # produces gen_mpris.dll and gen_mpris_unixlib.so
-cp gen_mpris.dll ~/.wine/drive_c/Program\ Files/WACUP/Plugins/
-cp gen_mpris_unixlib.so /usr/lib/i386-linux-gnu/wine/  # or appropriate WINE lib path
+```
+byte  endianness  ('l' = little-endian)
+byte  message type (1=call, 2=return, 3=error, 4=signal)
+byte  flags
+byte  protocol version (1)
+u32   body length
+u32   serial
+u32   header fields array length
+... header fields (type byte + variant, padded to 8-byte boundary each)
+... body (padded to 8-byte boundary from start of message)
 ```
 
-### Known risks / brittleness
+### Phase 3 — Message parser (~300 lines)
 
-- **WINE version coupling**: `__wine_unix_call` ABI changed between WINE 7.x and 8.x and again in 9.x. The `.so` must be compiled against the same WINE version headers as the installed WINE.
-- **32-bit requirement**: WACUP is x86, so the `.so` must also be 32-bit (`-m32`), requiring `libdbus-1-dev:i386` and 32-bit WINE development headers.
-- **DLL loading path**: WINE needs to find the companion `.so` ? this depends on the WINE prefix and lib search path configuration.
-- **D-Bus session bus discovery**: the Unix side needs `$DBUS_SESSION_BUS_ADDRESS`, which should be inherited from the WINE process environment but may not always be.
-- **Thread safety**: D-Bus calls happen on the WACUP main thread (via timer callback ? unix_call). This is single-threaded and avoids race conditions but means D-Bus responsiveness depends on the timer interval.
+Read incoming messages from the socket, extract:
+- Header fields: serial, reply_serial, path, interface, member, sender
+- Body arguments for incoming method calls:
+  - `Seek` → int64 offset
+  - `SetPosition` → object_path + int64
+  - `Set` (volume) → string + string + variant(double)
+  - `Play`, `Pause`, `Next`, etc. → no body
+
+Non-blocking reads using `select()` with zero timeout, same pattern as current `ipc_recv_command()`.
+
+### Phase 4 — Main loop integration (~200 lines)
+
+Replace timer_proc's TCP calls with direct D-Bus I/O:
+
+```
+plugin init:
+  → connect to D-Bus socket
+  → auth handshake
+  → send Hello, get unique name
+  → send RequestName "org.mpris.MediaPlayer2.wacup"
+
+each 250ms timer tick:
+  → select(dbus_fd, timeout=0) — non-blocking check
+  → read + dispatch any pending method calls → queue commands
+  → gather WACUP state via SendMessage(WM_WA_IPC)
+  → if state changed → marshal + send PropertiesChanged signal
+  → dispatch queued commands via SendMessage(WM_COMMAND)
+
+plugin quit:
+  → send ReleaseName
+  → closesocket
+```
+
+Static globals: socket fd, serial counter, unique D-Bus name, last known state.
+
+### Phase 5 — X11 window tagging
+
+The current `set_kde_desktop_file_hint()` uses Xlib (ELF). From the PE side, options:
+
+1. **Keep a minimal host** for X11 tagging only — 10 lines, no D-Bus, fires once at startup. Much simpler than the current host.
+2. **Shell out** via `CreateProcessA("/bin/sh", "sh -c \"xprop -root ...\"")` once at startup — no persistent process needed.
+3. **Skip it** — `desktopFile` in KWin still works if `wacup.desktop` is installed in `~/.local/share/applications/`.
+
+Option 2 is probably the right call: one-shot, no dependencies.
+
+### Risk assessment
+
+| Risk                                                    | Severity |
+|---------------------------------------------------------|----------|
+| `a{sv}` marshaling bugs (alignment, nested containers) | High     |
+| 32-bit Wine Winsock `AF_UNIX` working correctly         | Medium   |
+| dbus-daemon rejecting `EXTERNAL` auth without UID       | Low      |
+| Blocking reads stalling WACUP main thread               | Low      |
+
+The alignment rules are the biggest source of subtle bugs. Every struct/dict entry must start on an 8-byte boundary; every string on a 4-byte boundary; every int32 on 4 bytes. Off-by-one padding errors will cause dbus-daemon to silently drop or misparse messages.
+
+**Total estimated new code:** ~1000–1500 lines of C replacing gen_mpris_host.c and the TCP layer in gen_mpris.c.
+
+### References
+
+- D-Bus specification: https://dbus.freedesktop.org/doc/dbus-specification.html
+- udbus (wire protocol reference): https://github.com/vincenthz/udbus
+- adbus (service-side reference): https://github.com/jmckaskill/adbus
+- Wine winebth.sys (Option A reference): https://github.com/wine-mirror/wine/blob/master/dlls/winebth.sys/
